@@ -1,0 +1,43 @@
+/tensorrt_infer/build/
+/rfdetr_result.jpg
+__pycache__/
+
+# Local model and TensorRT build outputs. These files are regenerated from the
+# scripts and are intentionally kept out of the GitHub repository.
+*.onnx
+*.engine
+*.pth
+*.plan
+
+# Large evaluation and calibration data.
+**/coco_predictions*.json
+/coco_predictions*.json
+**/.inputs.json
+**/calibration_cache/
+
+# Generated decoder candidates and raw profile dumps. Keep the compact report,
+# summary CSV/JSON and plots tracked instead.
+/tensorrt_quant_decoder/artifacts/
+/tensorrt_quant_decoder/compute_graph_analysis/baseline_profile.json
+/tensorrt_quant_decoder/compute_graph_analysis/onnx_compute_nodes.csv
+/tensorrt_quant_decoder/compute_graph_analysis/tensorrt_profile_layers.csv
+
+# Generated images and local logs at the repository root.
+/python_infer/res.jpg
+/img/*.jpg
+/coco_predictions.json
+
+# Calibration manifests contain machine-specific absolute image paths and are
+# regenerated with each experiment.
+**/calibration_manifest.json
+**/calibration_images*.txt
+
+# Historical experiment directories are local caches; final numerical tables
+# are reproduced in the Markdown reports and decoder summary CSV.
+/tensort_quant/artifacts_xlarge*/
+/tensort_quant/inference_only_benchmark.json
+/tensort_quant/error_analysis_*/**/*.json
+/tensort_quant/error_analysis_*/**/*.csv
+/coco_baseline.json
+/note.txt
+/.vscode/

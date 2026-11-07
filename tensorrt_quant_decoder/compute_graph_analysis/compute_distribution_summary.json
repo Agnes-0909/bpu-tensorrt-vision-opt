@@ -1,0 +1,125 @@
+{
+  "model": "/home/rton/rfdetr/tensort_quant/artifacts_xlarge_smoothquant_256/rfdetr-xlarge-smoothquant-256.onnx",
+  "input_shape": [
+    1,
+    3,
+    700,
+    700
+  ],
+  "stage_definition": {
+    "encoder": "backbone DINOv2 + multi-scale feature projector",
+    "head": "transformer enc_output/enc_out_* selection and class/bbox heads; head includes pre/post decoder regions in TensorRT profile",
+    "decoder": "transformer.decoder.ref_point_head and 5 decoder layers",
+    "other": "graph glue not attributed to named stages in ONNX FLOPs table"
+  },
+  "onnx_dense_compute": {
+    "total_gflops": 292.567185408,
+    "stages": {
+      "encoder": {
+        "node_count": 1865,
+        "dense_operator_count": 105,
+        "flops": 280056651776.0,
+        "gflops": 280.05665177599997,
+        "by_operator_gflops": {
+          "Conv": 16.3874816,
+          "MatMul": 263.66917017599997
+        },
+        "by_substage_gflops": {
+          "FFN fc1": 69.41992550399999,
+          "FFN fc2": 69.41992550399999,
+          "attention AV": 27.704696831999996,
+          "attention QKV projection": 52.064944128,
+          "attention QK^T": 27.704696831999996,
+          "attention output projection": 17.354981375999998,
+          "feature projector": 14.1295616,
+          "other": 2.25792
+        },
+        "flops_pct": 95.72387668338354
+      },
+      "decoder": {
+        "node_count": 914,
+        "dense_operator_count": 62,
+        "flops": 11735570432.0,
+        "gflops": 11.735570432,
+        "by_operator_gflops": {
+          "MatMul": 10.949138432,
+          "Gemm": 0.786432
+        },
+        "by_substage_gflops": {
+          "FFN": 6.291456,
+          "deformable cross-attention": 1.37626112,
+          "reference-point head": 0.000525312,
+          "self-attention": 4.067328
+        },
+        "flops_pct": 4.011239475006106
+      },
+      "head": {
+        "node_count": 44,
+        "dense_operator_count": 9,
+        "flops": 774963200.0,
+        "gflops": 0.7749632,
+        "by_operator_gflops": {
+          "MatMul": 0.7749632
+        },
+        "by_substage_gflops": {
+          "decoder bbox head": 0.31580159999999996,
+          "decoder class head": 0.0279552,
+          "encoder output projection": 0.0012544,
+          "other": 0.429952
+        },
+        "flops_pct": 0.2648838416103549
+      },
+      "other": {
+        "node_count": 197,
+        "dense_operator_count": 0,
+        "flops": 0.0,
+        "gflops": 0.0,
+        "by_operator_gflops": {},
+        "by_substage_gflops": {},
+        "flops_pct": 0.0
+      }
+    }
+  },
+  "tensorrt_profile": {
+    "profile_file": "/home/rton/rfdetr/tensorrt_quant_decoder/compute_graph_analysis/baseline_profile.json",
+    "profile_sum_ms": 17.547334448,
+    "stage_boundaries": {
+      "first_head": 230,
+      "first_decoder": 244,
+      "first_final_head": 345
+    },
+    "stages": {
+      "encoder": {
+        "layer_count": 230,
+        "profile_sum_ms": 14.936325709,
+        "profile_sum_pct": 85.12022057
+      },
+      "head_predecoder": {
+        "layer_count": 14,
+        "profile_sum_ms": 0.2557366,
+        "profile_sum_pct": 1.4574106
+      },
+      "decoder": {
+        "layer_count": 101,
+        "profile_sum_ms": 2.26023772,
+        "profile_sum_pct": 12.8808058
+      },
+      "head_postdecoder": {
+        "layer_count": 6,
+        "profile_sum_ms": 0.095034419,
+        "profile_sum_pct": 0.54158844
+      },
+      "head": {
+        "layer_count": 20,
+        "profile_sum_ms": 0.35077101899999996,
+        "profile_sum_pct": 1.99899904
+      }
+    }
+  },
+  "limitations": [
+    "ONNX FLOPs count multiply-add as two operations and only reports Conv/MatMul/Gemm, where static shapes are available.",
+    "TensorRT fuses nodes; profile stage percentages are contiguous graph-region attribution and include fused glue kernels.",
+    "Profile sum is not identical to ordinary trtexec latency because profiling changes execution and reports per-layer timing.",
+    "The report is for batch 1, input 3x700x700, one stream, CUDA Graph enabled."
+  ]
+}
