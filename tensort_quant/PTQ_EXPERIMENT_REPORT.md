@@ -17,16 +17,20 @@
 
 其中，`quantize_int8.py` 是本报告大部分 Q/DQ 分组实验的主要脚本，SmoothQuant 部分则由 `modelopt_smoothquant.py` 完成。
 
-## 2. 实验分组
+## 2. 先盘点完整图，再定义实验范围
 
-| 产物目录 | INT8 节点 | 保留 FP32 的主要部分 |
+完整图由 DINOv2 encoder、encoder 输出筛选、5 层 DETR decoder 和 class/bbox detection head 组成。encoder block 中要区分 Q/K/V projection、QKᵀ、Softmax、AV、attention output projection 和 FFN `fc1/fc2`；decoder layer 中要区分 self-attention、deformable cross-attention、FFN、reference point head 和 detection head。
+
+| 产物目录 | 实际 INT8 节点 | 明确保留 FP32/原精度的主要部分 |
 |---|---|---|
-| `artifacts_xlarge_decoder/` | Conv + DETR decoder MatMul | DINOv2 backbone、归一化、残差、softmax、检测头 |
-| `artifacts_xlarge_dino_ffn/` | DINOv2 MLP `fc1/fc2` MatMul | DINOv2 attention、DETR decoder、归一化、残差、softmax、检测头 |
-| `artifacts_xlarge_dino_qkv/` | DINOv2 attention 的 query/key/value projection MatMul | DINOv2 attention score/output、MLP、DETR decoder、归一化、残差、softmax、检测头 |
-| `artifacts_xlarge_dino_qkvo/` | DINOv2 attention 的 Q/K/V + output projection MatMul | attention score、Softmax、LayerNorm、MLP、DETR decoder、检测头 |
-| `artifacts_xlarge_smoothquant/` | ModelOpt SmoothQuant：DINOv2 encoder Linear | Conv、decoder、LayerNorm、残差、softmax、deformable attention、检测头 |
-| `artifacts_xlarge_smoothquant_256/` | 同上，256 张校准图片 | 同上 |
+| `artifacts_xlarge_decoder/` | Conv 加上排除 `/backbone/` 后剩余的 Conv/MatMul；因此实际还包含 decoder score/AV、reference point、encoder output 分支和 detection head MatMul | DINOv2 backbone 的大部分节点、LayerNorm、residual、Softmax、GridSample 等非目标算子；这是历史范围较宽的 decoder-only 实验 |
+| `artifacts_xlarge_dino_ffn/` | 12 个 DINOv2 block 的 `mlp/fc1/MatMul` 和 `mlp/fc2/MatMul` | DINOv2 Q/K/V、QKᵀ、AV、attention output、LayerNorm、residual、整个 decoder、reference point 和检测 head |
+| `artifacts_xlarge_dino_qkv/` | 12 个 DINOv2 block 的 query/key/value projection，共 36 个 MatMul | QKᵀ、Softmax、AV、attention output、FFN、LayerNorm、residual、整个 decoder、reference point 和检测 head |
+| `artifacts_xlarge_dino_qkvo/` | DINOv2 QKV projection 加 attention output projection，共 48 个 MatMul | QKᵀ、Softmax、AV、FFN、LayerNorm、residual、整个 decoder、reference point 和检测 head |
+| `artifacts_xlarge_smoothquant/` | ModelOpt SmoothQuant：DINOv2 encoder Linear 的输入和权重 | Conv、QKᵀ、Softmax、AV、decoder、LayerNorm、residual、deformable sampling、reference point 和检测 head |
+| `artifacts_xlarge_smoothquant_256/` | 与上行相同，校准集改为 256 张 | 与上行相同 |
+
+这里“保留 FP32”表示节点自身没有插入 Q/DQ；如果它的输入来自上游量化节点，输入数值仍可能带有量化误差。`artifacts_xlarge_decoder/` 是历史实验，不能当作严格的“只量化 decoder Linear”范围。
 
 `artifacts_xlarge_decoder/` 使用已有产物重新完成了完整 5000 张 COCO 评测；其原先只有 100 张图片的结果不用于结论。
 

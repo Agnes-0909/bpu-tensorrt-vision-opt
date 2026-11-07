@@ -29,19 +29,39 @@
 
 原始总报告：[INT8_QUANTIZATION_REPORT.md](INT8_QUANTIZATION_REPORT.md)；分组实验和 PTQ 记录：[PTQ_EXPERIMENT_REPORT.md](PTQ_EXPERIMENT_REPORT.md)。
 
-## 3. 量化策略和实验范围
+## 3. 先盘点完整计算图，再说明各方案的量化范围
 
-| 方案 | INT8 范围 | 主要保留 FP32 的部分 | 校准/变换 |
+### 3.1 完整计算图中的层和算子
+
+下面先定义“模型有哪些层”。后面每个方案只在这张清单上标记哪些进入 INT8，避免把“存在的层”和“实际量化的层”混为一谈。
+
+| 图阶段 | 层/子模块 | 主要算子 | 作用 |
 |---|---|---|---|
-| 全量 MinMax | 所有 Conv + 所有 MatMul | 归一化、残差、Softmax 等非目标算子 | ORT MinMax，64 张 |
-| Conv-only MinMax | Conv | DINOv2/Transformer MatMul、decoder、检测头 | ORT MinMax，64 张 |
-| Decoder-only | Conv + DETR decoder MatMul | DINOv2 backbone、归一化、残差、Softmax、检测头 | ORT MinMax，64 张 |
-| DINO FFN | encoder FFN fc1/fc2 | attention、decoder 和检测头 | ORT MinMax，64 张 |
-| DINO QKV | encoder Q/K/V projection | attention score、AV、FFN、decoder | ORT MinMax，64 张 |
-| DINO QKVO | encoder Q/K/V + attention output projection | attention score、Softmax、LayerNorm、FFN、decoder | ORT MinMax，64 张 |
-| Encoder MinMax | 12 blocks × 6 projection MatMul，共 72 个 | attention score、Softmax、LayerNorm、残差、decoder | ORT MinMax，64 张 |
-| Encoder Percentile | 与 Encoder MinMax 相同 | 同上 | p99.99 activation clipping，8 张 |
-| SmoothQuant | DINOv2 encoder Linear 输入/权重 | Conv、decoder、LayerNorm、残差、Softmax、检测头 | ModelOpt SmoothQuant，64/256 张 |
+| Encoder | DINOv2 patch embedding 和多尺度 feature projector | Conv、归一化、激活、拼接 | 从图像生成多尺度特征 |
+| Encoder | 12 个 DINOv2 Transformer block | LayerNorm、Q/K/V projection、QKᵀ、Softmax、AV、attention output projection、残差 | 提取全局视觉特征 |
+| Encoder | 12 个 block 的 FFN | `fc1`、激活、`fc2`、残差 | 对每个 token 做通道变换 |
+| Encoder→Head | `transformer/enc_output`、`enc_out_class_embed`、`enc_out_bbox_embed`、TopK | MatMul、TopK、Gather、Sigmoid 等 | 生成 encoder proposals 和初始 reference points |
+| Decoder | 5 个 decoder layer 的 self-attention | Q/K/V、QKᵀ、Softmax、AV、output projection/Gemm、LayerNorm、残差 | query 之间的信息交互 |
+| Decoder | 5 个 decoder layer 的 deformable cross-attention | value projection、attention weights、sampling offsets、GridSample、加权聚合、output projection | 从 encoder 特征中采样目标信息 |
+| Decoder | 5 个 decoder layer 的 FFN | `linear1`、激活、`linear2`、LayerNorm、残差 | 更新 object query |
+| Decoder | reference point head | 2 个 Linear/MatMul、Sigmoid 等 | 更新采样参考点 |
+| Detection head | class head 和 bbox head | `class_embed`、`bbox_embed`、Sigmoid、坐标变换 | 输出类别和边界框 |
+
+### 3.2 每个实验实际量化和保留的部分
+
+| 方案 | 实际进入 INT8 的层 | 明确保留 FP32/原精度的层和算子 | 校准/变换 |
+|---|---|---|---|
+| 全量 Conv+MatMul MinMax | 所有 Conv；encoder 的 Q/K/V、QKᵀ、AV、attention output、FFN `fc1/fc2`；decoder 的 self-attention、cross-attention、FFN、reference point 和 head MatMul | LayerNorm、Add/residual、Softmax、Reshape、Gather、GridSample 等非 Conv/MatMul 算子仍为原精度；但它们的输入可能已经被上游 Q/DQ 改变 | ORT static MinMax，64 张 |
+| Conv-only MinMax | 9 个 backbone/projector Conv | 所有 DINOv2 MatMul、attention score/Softmax/AV、FFN、decoder、reference point、class/bbox head | ORT static MinMax，64 张 |
+| 旧 Decoder-only | Conv 加上排除 backbone 后剩余的 Conv/MatMul；实际还包含 decoder score/AV、reference point、encoder output 分支和检测 head MatMul | DINOv2 backbone 的大部分节点、LayerNorm、residual、Softmax、GridSample 等非目标算子 | ORT static MinMax，64 张；这是历史范围较宽的实验，不能等同于严格 decoder-only |
+| DINO FFN | 12 个 encoder block 的 `mlp/fc1/MatMul` 和 `mlp/fc2/MatMul`，共 24 个 FFN projection | encoder Q/K/V、QKᵀ、AV、attention output、LayerNorm、residual、decoder、reference point、class/bbox head；Conv 也保持原精度 | ORT static MinMax，64 张 |
+| DINO QKV | 12 个 encoder block 的 query/key/value projection，共 36 个 MatMul | encoder QKᵀ、Softmax、AV、attention output、FFN、LayerNorm、residual、decoder 和 head | ORT static MinMax，64 张 |
+| DINO QKVO | DINO QKV 的 36 个 projection 加 attention output projection，共 48 个 MatMul | encoder QKᵀ、Softmax、AV、FFN、LayerNorm、residual、decoder、reference point 和 detection head | ORT static MinMax，64 张 |
+| Encoder MinMax | 12 blocks ×（Q/K/V、attention output、FFN `fc1/fc2`），共 72 个 projection MatMul；不包含 attention score 和 AV | encoder QKᵀ、Softmax、AV、LayerNorm、residual、Conv、整个 decoder、reference point、class/bbox head | ORT static MinMax，64 张 |
+| Encoder Percentile | 与 Encoder MinMax 完全相同的 72 个 projection MatMul | 与 Encoder MinMax 完全相同；只改变 activation scale 的统计方式 | p99.99 activation clipping，8 张 |
+| Encoder SmoothQuant | DINOv2 encoder 的 Linear：Q/K/V、attention output、FFN `fc1/fc2` 的输入和权重做 SmoothQuant；不量化 attention score/AV | Conv、QKᵀ、Softmax、AV、LayerNorm、residual、整个 decoder、reference point、class/bbox head | ModelOpt SmoothQuant，64/256 张 |
+
+这里的“保留 FP32”指该节点自身没有插入 INT8 Q/DQ；如果它接收的上游张量已经量化，输入分布仍可能受到上游误差影响。`DINO QKV/QKVO` 与 `Encoder MinMax` 的差别是：前两者只量化 attention projection，后者还加入 FFN projection；`SmoothQuant` 的目标层与 Encoder MinMax 接近，但通过通道重缩放降低输入 activation 的量化难度。
 
 Entropy 和 ORT 内置 Percentile 在当前 XLarge attention 图上会因为直方图校准的内存开销被系统 OOM kill。因此 Percentile 结果使用了 memory-efficient 的 `percentile_clip_encoder.py`：复用 encoder MinMax 的权重 Q/DQ 图，只重新统计 activation p99.99 scale。
 

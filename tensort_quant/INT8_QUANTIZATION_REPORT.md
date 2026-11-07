@@ -24,6 +24,18 @@ model.export(format="onnx", opset_version=16, output_dir="python_infer/output", 
 - 对称量化，权重 per-channel；
 - 输出为显式 Q/DQ ONNX。
 
+### 2.1 完整计算图与本报告方案的实际范围
+
+完整图先分为四类：DINOv2 encoder（patch embedding、12 个 Transformer block 和 FFN）、encoder 输出筛选分支、DETR decoder（5 个 layer，每层包含 self-attention、deformable cross-attention 和 FFN）、以及 class/bbox detection head。encoder 和 decoder 中的 attention 还要区分 Q/K/V projection、QKᵀ、Softmax、AV、output projection；这些不是同一个量化对象。
+
+| 方案 | 实际插入 INT8 Q/DQ 的层 | 明确保留 FP32/原精度的层 |
+|---|---|---|
+| 全量 Conv+MatMul MinMax | 所有 Conv；encoder 的 Q/K/V、QKᵀ、AV、attention output、FFN `fc1/fc2`；decoder 的 self/cross-attention MatMul、FFN、reference point 和检测 head MatMul | LayerNorm、residual Add、Softmax、Reshape、Gather、GridSample 等非 Conv/MatMul 节点自身未量化，但会接收上游量化误差 |
+| Conv-only MinMax | backbone/projector 的 9 个 Conv | 所有 encoder/decoder MatMul，包括 attention projection、QKᵀ、AV、FFN、reference point、class/bbox head；LayerNorm、residual、Softmax、GridSample 也保持原精度 |
+| 当前 Conv-only 混合部署候选 | 与 Conv-only MinMax 相同：只量化 9 个 Conv | DINOv2/Transformer MatMul、decoder、LayerNorm、residual、Softmax、reference point 和 detection head 全部保护 |
+
+因此，“Conv-only”不是“整个 encoder 量化”，而是只量化 9 个 Conv；报告中后续提到的 encoder SmoothQuant 属于另一条实验线，量化的是 encoder Linear 的输入/权重，不能与这里的 Conv-only 结果混为一谈。
+
 实验中发现 XLarge 的 DINOv2/Transformer 编码器对 MatMul 激活量化非常敏感。全量 Conv+MatMul INT8 的敏感性实验结果如下：TensorRT 推理均值从 26.4743 ms 降至 11.3143 ms，减少 15.1600 ms（57.26%，约 2.34× 加速）；包含预处理、推理和后处理的三阶段均值从 33.4005 ms 降至 18.0970 ms，减少 45.82%。但 COCO mAP@[0.50:0.95] 从 0.58137 降至 0.12592，绝对下降 0.45545，即 45.54 个百分点（相对下降 78.34%），不能作为部署方案。因此最终采用保精度的混合策略：
 
 - **INT8**：主干中的 Conv；
