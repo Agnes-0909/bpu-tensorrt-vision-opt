@@ -91,10 +91,65 @@ TensorRTEngine::TensorRTEngine(const std::string& engine_path) {
 }
 
 TensorRTEngine::~TensorRTEngine() {
+    release_persistent();
     delete context_;
     delete engine_;
     delete runtime_;
     delete logger_;
+}
+
+void TensorRTEngine::release_persistent() noexcept {
+    if (persistent_input_device_) {
+        cudaFree(persistent_input_device_);
+        persistent_input_device_ = nullptr;
+    }
+    for (void* pointer : persistent_output_devices_) {
+        if (pointer) cudaFree(pointer);
+    }
+    persistent_output_devices_.clear();
+    if (persistent_stream_) {
+        cudaStreamDestroy(persistent_stream_);
+        persistent_stream_ = nullptr;
+    }
+    persistent_initialized_ = false;
+}
+
+void TensorRTEngine::initialize_persistent() {
+    if (persistent_initialized_) return;
+    const nvinfer1::Dims input_dims = engine_->getTensorShape(input_name_.c_str());
+    check_dims(input_dims, input_name_.c_str());
+    if (!context_->setInputShape(input_name_.c_str(), input_dims)) {
+        throw std::runtime_error("setInputShape failed");
+    }
+
+    try {
+        check_cuda(cudaStreamCreate(&persistent_stream_), "cudaStreamCreate(persistent)");
+        check_cuda(cudaMalloc(&persistent_input_device_, volume(input_dims) * sizeof(float)),
+                   "cudaMalloc(persistent input)");
+        persistent_output_devices_.resize(output_names_.size(), nullptr);
+        for (std::size_t i = 0; i < output_names_.size(); ++i) {
+            const std::string& name = output_names_[i];
+            if (engine_->getTensorDataType(name.c_str()) != nvinfer1::DataType::kFLOAT) {
+                throw std::runtime_error("output '" + name + "' is not FLOAT");
+            }
+            const nvinfer1::Dims dims = context_->getTensorShape(name.c_str());
+            check_dims(dims, name.c_str());
+            check_cuda(cudaMalloc(&persistent_output_devices_[i], volume(dims) * sizeof(float)),
+                       "cudaMalloc(persistent output)");
+        }
+        if (!context_->setTensorAddress(input_name_.c_str(), persistent_input_device_)) {
+            throw std::runtime_error("setTensorAddress(persistent input) failed");
+        }
+        for (std::size_t i = 0; i < output_names_.size(); ++i) {
+            if (!context_->setTensorAddress(output_names_[i].c_str(), persistent_output_devices_[i])) {
+                throw std::runtime_error("setTensorAddress(persistent output) failed");
+            }
+        }
+        persistent_initialized_ = true;
+    } catch (...) {
+        release_persistent();
+        throw;
+    }
 }
 
 std::vector<TensorOutput> TensorRTEngine::infer(const std::vector<float>& input) {
@@ -148,6 +203,38 @@ std::vector<TensorOutput> TensorRTEngine::infer(const std::vector<float>& input)
         cudaStreamDestroy(stream);
         throw;
     }
+}
+
+std::vector<TensorOutput> TensorRTEngine::infer_persistent(const std::vector<float>& input) {
+    const nvinfer1::Dims input_dims = engine_->getTensorShape(input_name_.c_str());
+    if (volume(input_dims) != input.size()) throw std::invalid_argument("input element count does not match engine");
+    initialize_persistent();
+
+    std::vector<TensorOutput> outputs;
+    outputs.reserve(output_names_.size());
+    for (const std::string& name : output_names_) {
+        const nvinfer1::Dims dims = context_->getTensorShape(name.c_str());
+        check_dims(dims, name.c_str());
+        TensorOutput output;
+        output.name = name;
+        output.shape.reserve(dims.nbDims);
+        for (int j = 0; j < dims.nbDims; ++j) output.shape.push_back(dims.d[j]);
+        output.values.resize(volume(dims));
+        outputs.push_back(std::move(output));
+    }
+
+    check_cuda(cudaMemcpyAsync(persistent_input_device_, input.data(), input.size() * sizeof(float),
+                               cudaMemcpyHostToDevice, persistent_stream_),
+               "cudaMemcpyAsync(persistent input)");
+    if (!context_->enqueueV3(persistent_stream_)) throw std::runtime_error("enqueueV3 failed");
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        check_cuda(cudaMemcpyAsync(outputs[i].values.data(), persistent_output_devices_[i],
+                                   outputs[i].values.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   persistent_stream_),
+                   "cudaMemcpyAsync(persistent output)");
+    }
+    check_cuda(cudaStreamSynchronize(persistent_stream_), "cudaStreamSynchronize(persistent)");
+    return outputs;
 }
 
 }  // namespace rfdetr

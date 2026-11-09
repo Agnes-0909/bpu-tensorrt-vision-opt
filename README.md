@@ -131,6 +131,23 @@ python tensorrt_quant_decoder/summarize_decoder_experiments.py
 
 该脚本汇总完整 COCO mAP、延迟、engine 大小并生成 decoder 敏感性图表。详细说明见 [decoder 实验报告](tensorrt_quant_decoder/DECODER_EXPERIMENT_REPORT.md) 和 [decoder 方案](tensorrt_quant_decoder/DECODER_OPTIMIZATION_PLAN.md)。
 
+### 7. 阶段二高级优化
+
+当前量化版本的下一阶段优化方案位于 [`stage2_advanced_opt/`](stage2_advanced_opt/)。方案基于全图 TensorRT profile，优先处理 encoder attention 中占时间最大的 QKᵀ、Stable Softmax、AV 融合，并同步处理端侧持久 buffer、CUDA Graph 和应用调度开销。报告还说明了为什么不能直接把 Softmax 一律改成 INT8，以及 TensorRT 原生 `IAttention`、定制 fused attention、选择性 INT8/FP8、LayerNorm/residual 融合、decoder deformable plugin、token reduction 和结构化稀疏的优先级。
+
+```bash
+conda activate TensorRT
+cd stage2_advanced_opt
+python profile_hotspots.py \
+  --profile-csv ../tensorrt_quant_decoder/compute_graph_analysis/tensorrt_profile_layers.csv \
+  --out-dir analysis_outputs
+python inspect_attention_patterns.py \
+  ../tensort_quant/artifacts_xlarge_smoothquant_256/rfdetr-xlarge-smoothquant-256.onnx
+python summarize_stage2_experiment.py
+```
+
+详见 [阶段二高级优化方案](stage2_advanced_opt/STAGE2_ADVANCED_OPTIMIZATION_PLAN.md) 和 [阶段二实验报告](stage2_advanced_opt/STAGE2_EXPERIMENT_REPORT.md)。实验报告包含 attention 改写、Polygraphy/COCO 精度验证、TensorRT profile 以及持久 stream/device buffer 的端到端 benchmark。
+
 ## 目录说明
 
 | 路径 | 作用 |
@@ -140,6 +157,7 @@ python tensorrt_quant_decoder/summarize_decoder_experiments.py
 | `tensorrt_infer/` | C++ TensorRT benchmark 和端到端推理 |
 | `tensort_quant/` | encoder/PTQ/SmoothQuant/Polygraphy 分析脚本和阶段报告 |
 | `tensorrt_quant_decoder/` | decoder 敏感性、SmoothQuant、计算量和最终报告 |
+| `stage2_advanced_opt/` | attention 融合、选择性 QKᵀ/Softmax/AV 低精度、LayerNorm/residual 融合、CUDA Graph 和端侧运行时优化方案与诊断脚本 |
 | `evaluate_coco_tensorrt.py` | 统一 COCO TensorRT 评测入口 |
 | `BASELINE.md` | FP32 TensorRT 基线记录 |
 | `tensort_quant/FINAL_QUANTIZATION_REPORT.md` | encoder 和全量量化的最终诊断报告 |

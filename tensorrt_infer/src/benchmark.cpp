@@ -24,6 +24,7 @@ struct Arguments {
     int warmup = 100;
     float threshold = 0.5f;
     int background_class = -1;
+    std::string runtime_mode = "per_call";
 };
 
 struct Stats {
@@ -56,7 +57,7 @@ Stats summarize(std::vector<double> samples) {
 }
 
 void print_usage(const char* program) {
-    std::cerr << "Usage: " << program << " [engine] [image] [iterations] [warmup] [threshold] [background_class]\n";
+    std::cerr << "Usage: " << program << " [engine] [image] [iterations] [warmup] [threshold] [background_class] [per_call|persistent]\n";
 }
 
 Arguments parse_arguments(int argc, char** argv) {
@@ -67,7 +68,8 @@ Arguments parse_arguments(int argc, char** argv) {
     if (argc > 4) args.warmup = std::stoi(argv[4]);
     if (argc > 5) args.threshold = std::stof(argv[5]);
     if (argc > 6) args.background_class = std::stoi(argv[6]);
-    if (argc > 7) {
+    if (argc > 7) args.runtime_mode = argv[7];
+    if (argc > 8) {
         print_usage(argv[0]);
         throw std::invalid_argument("too many arguments");
     }
@@ -90,8 +92,9 @@ Arguments parse_arguments(int argc, char** argv) {
             }
         }
     }
-    if (args.iterations <= 0 || args.warmup < 0 || args.threshold < 0.0f || args.threshold > 1.0f) {
-        throw std::invalid_argument("iterations must be positive, warmup non-negative, threshold in [0,1]");
+    if (args.iterations <= 0 || args.warmup < 0 || args.threshold < 0.0f || args.threshold > 1.0f ||
+        (args.runtime_mode != "per_call" && args.runtime_mode != "persistent")) {
+        throw std::invalid_argument("iterations must be positive, warmup non-negative, threshold in [0,1], runtime mode must be per_call or persistent");
     }
     return args;
 }
@@ -138,7 +141,7 @@ int main(int argc, char** argv) {
 
         for (int i = 0; i < args.warmup; ++i) {
             const auto input = rfdetr::preprocess(image, engine.input_width(), engine.input_height());
-            const auto outputs = engine.infer(input);
+            const auto outputs = args.runtime_mode == "persistent" ? engine.infer_persistent(input) : engine.infer(input);
             static_cast<void>(decode(outputs, image, args.threshold, args.background_class));
         }
 
@@ -155,7 +158,7 @@ int main(int argc, char** argv) {
             const auto preprocess_end = Clock::now();
 
             const auto inference_begin = Clock::now();
-            const auto outputs = engine.infer(input);
+            const auto outputs = args.runtime_mode == "persistent" ? engine.infer_persistent(input) : engine.infer(input);
             const auto inference_end = Clock::now();
 
             const auto postprocess_begin = Clock::now();
@@ -171,7 +174,8 @@ int main(int argc, char** argv) {
         std::cout << "engine=" << args.engine << " image=" << args.image << '\n';
         std::cout << "iterations=" << args.iterations << " warmup=" << args.warmup
                   << " average_detections=" << static_cast<double>(detection_count) / args.iterations << '\n';
-        std::cout << "timing unit: milliseconds; inference includes H2D/D2H copies and per-call CUDA allocations\n";
+        std::cout << "runtime_mode=" << args.runtime_mode << '\n';
+        std::cout << "timing unit: milliseconds; inference includes H2D/D2H copies; per_call includes CUDA allocations, persistent reuses stream and device buffers\n";
         print_stats("preprocess", summarize(std::move(preprocess_times)));
         print_stats("inference", summarize(std::move(inference_times)));
         print_stats("postprocess", summarize(std::move(postprocess_times)));

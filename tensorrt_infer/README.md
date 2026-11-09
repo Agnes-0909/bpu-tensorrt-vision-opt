@@ -38,9 +38,19 @@ Run the 5000-iteration baseline benchmark (100 warmup iterations):
 ./tensorrt_infer/build/rfdetr_benchmark model.engine img/000000085772.jpg 5000 100
 ```
 
+The optional seventh argument selects the runtime resource policy. `per_call`
+keeps the original reference path, which creates/destroys a stream and allocates
+device buffers for every inference. `persistent` allocates them on the first
+call and reuses them:
+
+```bash
+./tensorrt_infer/build/rfdetr_benchmark model.engine img/000000085772.jpg 300 100 0.5 -1 persistent
+```
+
 The benchmark reads the image once before warmup. Its preprocessing timing is
-resize plus normalization; inference includes H2D/D2H copies and the current
-per-call CUDA allocations; postprocessing includes sigmoid decoding and sorting.
+resize plus normalization; inference includes H2D/D2H copies and synchronization.
+The `per_call` mode also includes CUDA allocations, while `persistent` reuses the
+stream and device buffers. Postprocessing includes sigmoid decoding and sorting.
 
 The fourth argument selects the background class slot. `-1` follows the Python
 reference and removes the last exported slot; `0` removes slot zero.

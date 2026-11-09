@@ -38,6 +38,22 @@ __pycache__/
 /tensort_quant/inference_only_benchmark.json
 /tensort_quant/error_analysis_*/**/*.json
 /tensort_quant/error_analysis_*/**/*.csv
+/stage2_advanced_opt/analysis_outputs/
+/stage2_advanced_opt/attention_patterns.txt
+# Keep generated experiment folders ignored by default. The custom operator
+# source below is explicitly unignored so it remains reviewable.
+/stage2_advanced_opt/experiments/*
+!/stage2_advanced_opt/experiments/fused_attention_plugin/
+!/stage2_advanced_opt/experiments/fused_attention_plugin/*.cu
+!/stage2_advanced_opt/experiments/fused_attention_plugin/*.py
+!/stage2_advanced_opt/experiments/fused_attention_plugin/*.sh
+!/stage2_advanced_opt/experiments/fused_attention_plugin/README.md
+/stage2_advanced_opt/experiments/fused_attention_plugin/build/
+/stage2_advanced_opt/experiments/fused_attention_plugin/*.onnx
+/stage2_advanced_opt/experiments/fused_attention_plugin/*.engine
+/stage2_advanced_opt/experiments/fused_attention_plugin/*.json
+/stage2_advanced_opt/experiments/fused_attention_plugin/*.log
+/stage2_advanced_opt/experiments/fused_attention_plugin/*.npy
 /coco_baseline.json
 /note.txt
 /.vscode/
