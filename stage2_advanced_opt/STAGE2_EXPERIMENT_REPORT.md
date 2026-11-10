@@ -303,24 +303,64 @@ FP16/BF16，不能对当前 FP32 plugin 直接调用；FP32 engine 会在运行�
 
 因此本实验的阶段性结论是：**FlashAttention 确实可以把当前 encoder attention
 路径从约 16.7 ms 降到约 8.0 ms；完整 COCO val2017 上 mAP 从 0.5802505 变为
-0.5803911，精度基本保持。当前 FP16 子图和 libtorch 依赖使它仍属于性能验证原型。**
-生产化应直接使用 TensorRT/CUTLASS/FlashAttention
-兼容的 CUDA kernel，保留 FP32 累加和稳定 Softmax，并按 12 层逐层记录误差、
-Softmax 熵、饱和率，再复测 COCO 全量评估。
+0.5803911，精度基本保持。该 PyTorch 版本仍属于性能上限对照，生产化候选已经
+转为下一节的独立 CUTLASS plugin。**
+独立版本继续保留 FP32 累加和稳定 Softmax，并已按完整 COCO 结果完成精度门禁。
 
 ## 7. 下一轮实验建议
 
 ### 7.1 定制 fused attention plugin
 
-plugin 内部完成 QKᵀ、online stable Softmax 和 AV，只写出最终 attention output，不落地完整 logits/probability tensor。当前 tiled CUDA 版本已经完成固定形状验证；PyTorch SDPA 版本已经验证了 FlashAttention 的性能上限候选，但 FP16 输入仍会累积到检测框误差，且依赖 libtorch。下一步应改为不依赖 PyTorch 的 CUTLASS/FlashAttention CUDA kernel，并保留 FP32 累加、最大值归约和指数和累加；完成后再逐层评估是否能安全扩大到 BF16/FP8 或 Q/K/V 的 INT8。
+plugin 内部完成 QKᵀ、online stable Softmax 和 AV，只写出最终 attention output，不落地完整 logits/probability tensor。当前 tiled CUDA 版本已经完成固定形状验证；独立 `RFDetrFusedAttention` engine 实测约 `106 ms`，远慢于 baseline 和 libtorch FlashAttention 的 `7–8 ms`，因此保留为正确性诊断基线。PyTorch SDPA 版本验证了 FlashAttention 的性能上限，但仍依赖 libtorch。当前生产化候选已转为下一节的独立 CUTLASS plugin，并继续保留 FP32 累加、最大值归约和指数和累加。
+
+### 7.1.1 独立 CUTLASS plugin 实现与验证
+
+本轮完成了上述生产化方向的第一版实现。`experiments/fused_attention_plugin/cutlass_flash_attention_plugin.cu` 使用 CUTLASS fused multi-head attention 的 Tensor Core/online Softmax kernel，注册为 `RFDetrCutlassFlashAttention`。它不包含任何 PyTorch 头文件或符号，`ldd build/libcutlass_flash_attention.so` 只显示 TensorRT 和 CUDA runtime；构建脚本为 [`build_cutlass_flash_plugin.sh`](experiments/fused_attention_plugin/build_cutlass_flash_plugin.sh)，外部依赖由 `CUTLASS_ROOT` 指向仓库外的 CUTLASS 源码树。图改写通过 `rewrite_to_plugin.py --half --cutlass-flash` 完成，仍保持原图的 Q/V `[B,H,S,D]`、K `[B,H,D,S]` 语义。
+
+为了避免第三方库查找影响端侧启动，使用 TensorRT 11.4 的 `--setPluginsToSerialize` 将 plugin 库嵌入 engine。嵌入后的 engine 已在清除 `LD_PRELOAD`、不提供 `--dynamicPlugins` 的情况下成功反序列化和推理；构建阶段仍需要 `.so` 来让 ONNX parser 找到 plugin creator。
+
+本机 RTX 5060 Ti、固定 `B=1,H=12,S=1226,D=64` 的对比为：
+
+| 方案 | 是否依赖 libtorch | `trtexec` 纯 GPU latency | COCO val2017 mAP@[.5:.95] |
+|---|---|---:|---:|
+| 原生 tiled CUDA plugin | 否 | `108.4 ms` | 未采用 |
+| PyTorch SDPA/FlashAttention | 是 | `8.03 ms` | `0.5803911` |
+| 独立 CUTLASS plugin，动态加载 | 否 | `9.99 ms` | `0.5806461` |
+| 独立 CUTLASS plugin，嵌入 engine | 否 | `9.86 ms`（10 次复测） | `0.5806461` |
+
+独立 CUTLASS 版本相对于 SmoothQuant baseline 的 mAP `0.5802505` 变化为 `+0.000396`，mAP50 为 `0.764572`，mAP75 为 `0.631102`。100 张图片的快速门禁为 mAP `0.637612`，与 baseline `0.638222` 的差值为 `-0.000610`；完整 5000 张结果优先用于结论。它比 libtorch 版本慢约 `1.8 ms`，但消除了 PyTorch runtime 依赖，达到当前阶段“独立可部署 plugin”的目标。当前实现固定 encoder shape，变长序列和其它 head 配置仍需单独生成模板并验证。
 
 ### 7.2 选择性 QKᵀ/AV 低精度
 
-当前 Q/K/V projection 已有 SmoothQuant Q/DQ，但 QKᵀ、Softmax、AV 的低精度还没有做校准实验。下一轮应从“Q/K/V 低精度输入、score/Softmax/累加 FP16”开始，每次只改变一个子路径，并保存每个 attention block 的输出误差、Softmax 熵和饱和率。不要直接把 Softmax 输出插入 INT8 Q/DQ。
+当前 Q/K/V projection 已有 SmoothQuant Q/DQ。本轮进一步做了实际的 QK/AV INT8 消融：
+输入图为 encoder SmoothQuant 256 校准图，只改变 encoder attention 中对应的 12 个
+MatMul 节点，Softmax、输出累加、decoder 和 head 保持原精度。100 张 COCO 子集结果如下：
+
+| 方案 | 量化节点 | inference 均值 | mAP@[.5:.95] | 相对 baseline |
+|---|---|---:|---:|---:|
+| Encoder SmoothQuant baseline | Q/K/V projection 已有 SQ | 17.95 ms | 0.6544 | — |
+| QK-only INT8 | 12 个 QKᵀ MatMul | 26.42 ms | 0.5855 | -0.0689 |
+| AV-only INT8 | 12 个 AV MatMul | 24.92 ms | 0.5173 | -0.1371 |
+| QK+AV INT8 | 24 个 QKᵀ/AV MatMul | 12.54 ms | 0.2829 | -0.3715 |
+
+QK/AV INT8 虽然联合方案命中了更快的 TensorRT tactic，但低精度误差改变了 attention
+logits 排序和 AV 加权结果，精度损失远超当前门槛；单独量化 QK 或 AV 还可能因为额外
+Q/DQ 和 reformat 变慢。因此当前方案不采用 QK/AV INT8。后续若继续尝试，应优先使用
+FP8 或在融合 kernel 内部保留 FP16/FP32 累加，并逐层记录输出误差、Softmax 熵和饱和率。
 
 ### 7.3 运行时的剩余空间
 
-`infer_persistent()` 目前仍使用普通 host `std::vector<float>`，每次同步等待完成；可以继续尝试 pinned host buffer、异步流水和固定地址 CUDA Graph capture。但这些优化应和模型 kernel 优化分开报告，避免把 host 调度收益误算成 attention 加速。
+`infer_persistent()` 目前仍使用普通 host `std::vector<float>` 作为 CPU 对照；阶段三已经
+验证 pinned host buffer、同一 stream 异步串接和固定地址 CUDA Graph capture。FlashAttention
+FP16 engine 的 CUDA Graph 推理段约 7.21 ms，完整 COCO mAP 保持 0.580853。后续仍可
+继续做多帧双缓冲和 GPU 解码，但这些优化应和模型 kernel 优化分开报告。
+
+### 7.4 LayerNorm/residual 审计
+
+新增 `diagnose_layernorm_fusion.py` 对当前 351 个 TensorRT profile layer 做名称和融合形态
+审计：没有独立的 LayerNorm layer，存在 111 个 Add layer 和大量包含 Mean/Sub/Mul/Scale
+的长融合层名。当前证据表明 TensorRT 已经吸收了部分 LayerNorm、pointwise 和 residual
+计算，直接手写重写可能引入 reformat；本项先完成审计，暂不做未经 profile 支持的图修改。
 
 ## 8. 产物和复现实验
 
@@ -337,6 +377,9 @@ plugin 内部完成 QKᵀ、online stable Softmax 和 AV，只写出最终 atten
 | `experiments/fused_attention_plugin/coco_sdpa_100.json` | FlashAttention/SDPA plugin 的 COCO 100 张评估 |
 | `experiments/fused_attention_plugin/coco_sdpa_full.json` | FlashAttention/SDPA plugin 的完整 5000 张 COCO val2017 评估 |
 | `experiments/fused_attention_plugin/profile_torch_sdpa.log` | FlashAttention/SDPA plugin 的 trtexec 纯 GPU 延迟日志 |
+| [`experiments/fused_attention_plugin/cutlass_flash_attention_plugin.cu`](experiments/fused_attention_plugin/cutlass_flash_attention_plugin.cu) | 不依赖 libtorch 的 CUTLASS fused attention plugin |
+| [`experiments/fused_attention_plugin/build_cutlass_flash_plugin.sh`](experiments/fused_attention_plugin/build_cutlass_flash_plugin.sh) | 使用外部 `CUTLASS_ROOT` 构建独立 plugin `.so` |
+| [`experiments/fused_attention_plugin/check_plugin_dependencies.sh`](experiments/fused_attention_plugin/check_plugin_dependencies.sh) | 对比 PyTorch plugin 和 CUTLASS plugin 的动态库依赖 |
 | [`tensorrt_infer/src/infer.cpp`](../tensorrt_infer/src/infer.cpp) | `infer_persistent()` 的持久 stream/device buffer 实现 |
 | [`tensorrt_infer/src/benchmark.cpp`](../tensorrt_infer/src/benchmark.cpp) | `per_call`/`persistent` runtime benchmark 参数 |
 

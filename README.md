@@ -2,9 +2,20 @@
 
 本仓库记录 RF-DETR XLarge 从 PyTorch 导出、FP32 TensorRT 基线、计算图分析，到 encoder 和 decoder 选择性 INT8 量化的完整过程。模型文件、TensorRT engine、COCO 逐图预测和大体积实验产物保留在本地，但默认不会进入 Git。
 
+![RF-DETR XLarge 端到端优化阶段耗时](figures/optimization_stage_timing.png)
+
+图中每根柱子都是一次端到端单图调用的平均耗时，横轴按优化顺序排列，纵轴是毫秒；柱子从下到上依次是前处理、TensorRT 推理、后处理。每个可读的色块内同时给出该阶段的绝对时间和它占总时间的百分比，柱子下方再次列出 `pre / infer / post` 占比，便于区分“模型变快”和“数据搬运变快”。FP32 基线约 `33.40 ms`，最初全量 Conv+MatMul INT8 降到 `18.10 ms`，但 mAP 只有 `0.12592`，因此图中标记为 `failed accuracy`；FlashAttention 把推理段降到约 `8.80 ms`，CUDA fused 前处理再把前处理从约 `6.60 ms` 降到约 `0.22 ms`，总时间约 `8.41 ms`。这些数字来自各阶段报告的 mean benchmark；FlashAttention 和 CUDA 前处理使用 persistent runtime，早期 FP32/全量 INT8 数据使用当时的 C++ benchmark 配置，不能把它们当成同一 runtime 参数下的严格 A/B 测试，精确命令和 P95 见对应报告。
+
+| 阶段 | 前处理 | TensorRT 推理 | 后处理 | 总计 | 精度状态 | 数据来源 |
+|---|---:|---:|---:|---:|---|---|
+| FP32 TensorRT | 6.855 ms | 26.474 ms | 0.071 ms | 33.400 ms | mAP 0.581367 | [FP32 基线](BASELINE.md) |
+| 最初全量 Conv+MatMul INT8 | 6.712 ms | 11.314 ms | 0.070 ms | 18.097 ms | mAP 0.12592，失败 | [INT8 报告](tensort_quant/INT8_QUANTIZATION_REPORT.md) |
+| FlashAttention（PyTorch SDPA，FP16 attention） | 6.60 ms | 8.80 ms | 0.07 ms | 15.47 ms | mAP 0.580391 | [阶段二报告](stage2_advanced_opt/STAGE2_EXPERIMENT_REPORT.md) |
+| CUDA fused 前处理 + FlashAttention | 0.22 ms | 8.13 ms | 0.06 ms | 8.41 ms | mAP 0.580853 | [阶段三报告](stage3_accelerate_process/README.md) |
+
 ## 当前方案
 
-当前阶段推荐方案是：
+当前量化主线方案是：
 
 ```text
 PyTorch RF-DETR XLarge
@@ -13,6 +24,8 @@ PyTorch RF-DETR XLarge
   → decoder Linear SmoothQuant（同一组 256 张校准图）
   → TensorRT engine
 ```
+
+在这条保精度量化主线上，阶段二提供独立 CUTLASS FlashAttention plugin，阶段三提供 CUDA fused 前处理；两者是运行时和计算图加速层，可以组合到同一端侧 pipeline。CUTLASS plugin 已通过 COCO 全量精度门禁，并可嵌入 TensorRT engine，避免部署时依赖 libtorch 和外部 plugin 查找。
 
 对应本地模型和 engine：
 
@@ -148,6 +161,14 @@ python summarize_stage2_experiment.py
 
 详见 [阶段二高级优化方案](stage2_advanced_opt/STAGE2_ADVANCED_OPTIMIZATION_PLAN.md) 和 [阶段二实验报告](stage2_advanced_opt/STAGE2_EXPERIMENT_REPORT.md)。实验报告包含 attention 改写、Polygraphy/COCO 精度验证、TensorRT profile 以及持久 stream/device buffer 的端到端 benchmark。
 
+### 8. 阶段三前后处理 CUDA 加速
+
+阶段三已完成 P1 前处理 CUDA 原型：OpenCV 解码后上传 RGB uint8，CUDA fused kernel 完成 resize、normalize、HWC→NCHW，并直接写入 TensorRT persistent input device buffer。4 张 COCO 图片上的输入张量 max absolute error 小于 `1e-6`，CUDA 前处理约 `0.33 ms`，CPU 前处理约 `7.2 ms`。以 FlashAttention FP16 engine 为例，单图 persistent 三段耗时从约 `15.47 ms` 降到 `8.41 ms`，约下降 `45.6%`；完整 COCO 5000 张 mAP 为 CPU `0.580813`、CUDA `0.580853`，差值 `+0.000040`。当前 SmoothQuant decoder engine 的完整 COCO mAP 为 CPU `0.580615`、CUDA `0.580423`，差值 `-0.000192`。P2 的同一 stream 异步串接已验证，单图约 `8.23 ms`，pinned host RGB 上传约 `0.246 ms`，相比 pageable 的 `0.394 ms` 有进一步下降；固定 shape 的 CUDA Graph 将推理段降到约 `7.21 ms`，完整 COCO mAP 保持 `0.580853`。P3 nvJPEG 解码原型约 `0.747 ms` 且输入误差小于 `1e-6`，还需连续帧和目标端验证。双缓冲和 CUDA 后处理仍按实测逐步加入。
+
+阶段二的模型侧阶段性结果：PyTorch FlashAttention 原型仍保留作性能上限对照；独立 CUTLASS plugin 已完成并通过 COCO 全量精度门禁，且已验证可将 plugin 库嵌入 engine，去除 libtorch 和运行时外部 `.so` 查找。LayerNorm/residual 已完成 profile 审计，当前无独立 LayerNorm 可安全手工融合；QK/AV 选择性 INT8 已验证但因精度损失拒绝。
+
+详见 [阶段三前处理加速方案](stage3_accelerate_process/STAGE3_PREPROCESS_OPTIMIZATION_PLAN.md) 和 [阶段三目录说明](stage3_accelerate_process/README.md)。
+
 ## 目录说明
 
 | 路径 | 作用 |
@@ -158,7 +179,10 @@ python summarize_stage2_experiment.py
 | `tensort_quant/` | encoder/PTQ/SmoothQuant/Polygraphy 分析脚本和阶段报告 |
 | `tensorrt_quant_decoder/` | decoder 敏感性、SmoothQuant、计算量和最终报告 |
 | `stage2_advanced_opt/` | attention 融合、选择性 QKᵀ/Softmax/AV 低精度、LayerNorm/residual 融合、CUDA Graph 和端侧运行时优化方案与诊断脚本 |
+| `stage3_accelerate_process/` | 前处理 resize/normalize/layout 的 CUDA fused kernel、GPU 解码、后处理和端到端流水线优化方案 |
+| `generate_optimization_overview.py` / `figures/` | 生成根 README 开头的阶段性端到端耗时堆叠图；图中标注前处理、推理、后处理绝对耗时和占比 |
 | `evaluate_coco_tensorrt.py` | 统一 COCO TensorRT 评测入口 |
+| `visualize_tensorrt.py` | 调用 C++ TensorRT 推理并将检测框绘制到图片，适合单图快速目视检查 |
 | `BASELINE.md` | FP32 TensorRT 基线记录 |
 | `tensort_quant/FINAL_QUANTIZATION_REPORT.md` | encoder 和全量量化的最终诊断报告 |
 | `tensorrt_quant_decoder/compute_graph_analysis/` | encoder/decoder/head 计算量与 TensorRT profile |

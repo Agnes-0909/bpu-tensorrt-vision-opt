@@ -29,6 +29,15 @@ public:
     // stage-2 runtime experiment; the original infer() path remains the
     // per-call allocation reference.
     std::vector<TensorOutput> infer_persistent(const std::vector<float>& input);
+    // Stage 3 path: the caller fills persistent_input_device() on
+    // persistent_stream(), then this method runs TensorRT without another H2D
+    // copy. The stream and buffer remain owned by TensorRTEngine.
+    void initialize_persistent();
+    void initialize_cuda_graph();
+    void* persistent_input_device();
+    cudaStream_t persistent_stream() const;
+    std::vector<TensorOutput> infer_persistent_device_input();
+    std::vector<TensorOutput> infer_persistent_device_input_cuda_graph();
     int input_width() const { return input_width_; }
     int input_height() const { return input_height_; }
 
@@ -47,9 +56,11 @@ private:
     void* persistent_input_device_ = nullptr;
     std::vector<void*> persistent_output_devices_;
     bool persistent_initialized_ = false;
+    cudaGraph_t persistent_graph_ = nullptr;
+    cudaGraphExec_t persistent_graph_exec_ = nullptr;
+    bool persistent_graph_initialized_ = false;
 
     void release_persistent() noexcept;
-    void initialize_persistent();
 };
 
 }  // namespace rfdetr

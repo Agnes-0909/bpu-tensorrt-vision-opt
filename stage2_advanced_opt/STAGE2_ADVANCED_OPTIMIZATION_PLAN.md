@@ -120,7 +120,7 @@ TensorRT 11.4 的 `IAttention` 抽象包含两次 BMM 和一个 normalization，
 
 plugin 的主要风险是：head layout、mask 语义、scale 位置和 residual 输入稍有不一致就会造成检测结果漂移。必须用 Polygraphy 抓取同一输入的中间结果，并对每一层 attention 输出做误差门禁。
 
-本轮已完成一个固定形状参考实现和一个 PyTorch SDPA/FlashAttention 原型，代码和复现命令见 [`experiments/fused_attention_plugin/README.md`](experiments/fused_attention_plugin/README.md)。tiled CUDA kernel 约 108 ms，仍慢于 baseline；SDPA/FlashAttention FP16 attention 约 8.03 ms，相对 baseline 16.69 ms 约降低 51.9%。但后者的 `dets` cosine 只有 0.773431，且依赖 libtorch 动态库，因此当前只能作为 kernel 性能上限候选，不能直接作为生产 engine。下一步应将已验证的 `[B,H,S,D]` layout 和 online Softmax 语义移植到不依赖 PyTorch 的 CUTLASS/FlashAttention CUDA plugin，并在 COCO 数据集上做精度门禁。
+本轮已完成固定形状参考实现、PyTorch SDPA/FlashAttention 原型和独立 CUTLASS plugin，代码和复现命令见 [`experiments/fused_attention_plugin/README.md`](experiments/fused_attention_plugin/README.md)。tiled CUDA kernel 约 108 ms，保留为正确性诊断基线；SDPA/FlashAttention FP16 attention 约 8.03 ms，相对 baseline 16.69 ms 约降低 51.9%，但依赖 libtorch。独立 CUTLASS plugin 约 9.99 ms，完整 COCO mAP 为 0.5806461，并已验证使用 `--setPluginsToSerialize` 嵌入 engine 后可以去除运行时 libtorch 和外部 plugin 查找。当前仍固定 `[B,H,S,D]` layout、`B=1,H=12,S=1226,D=64`，变长序列和其它 head 配置需要单独扩展。
 
 ## 7. 方案 C：选择性 Q/K/V、QKᵀ 和 AV 低精度
 

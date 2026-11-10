@@ -1,6 +1,9 @@
+#include "cuda_preprocess.h"
 #include "infer.h"
 #include "postprocess.h"
 #include "preprocess.h"
+
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -57,7 +61,9 @@ Stats summarize(std::vector<double> samples) {
 }
 
 void print_usage(const char* program) {
-    std::cerr << "Usage: " << program << " [engine] [image] [iterations] [warmup] [threshold] [background_class] [per_call|persistent]\n";
+    std::cerr << "Usage: " << program
+              << " [engine] [image] [iterations] [warmup] [threshold] [background_class]"
+                 " [per_call|persistent|cuda_preprocess|cuda_preprocess_pinned|cuda_preprocess_async|cuda_graph]\n";
 }
 
 Arguments parse_arguments(int argc, char** argv) {
@@ -93,8 +99,12 @@ Arguments parse_arguments(int argc, char** argv) {
         }
     }
     if (args.iterations <= 0 || args.warmup < 0 || args.threshold < 0.0f || args.threshold > 1.0f ||
-        (args.runtime_mode != "per_call" && args.runtime_mode != "persistent")) {
-        throw std::invalid_argument("iterations must be positive, warmup non-negative, threshold in [0,1], runtime mode must be per_call or persistent");
+        (args.runtime_mode != "per_call" && args.runtime_mode != "persistent" &&
+         args.runtime_mode != "cuda_preprocess" && args.runtime_mode != "cuda_preprocess_pinned" &&
+         args.runtime_mode != "cuda_preprocess_async" && args.runtime_mode != "cuda_graph")) {
+        throw std::invalid_argument(
+            "iterations must be positive, warmup non-negative, threshold in [0,1], runtime mode must be "
+            "per_call, persistent, cuda_preprocess, cuda_preprocess_pinned, cuda_preprocess_async, or cuda_graph");
     }
     return args;
 }
@@ -124,11 +134,9 @@ std::size_t decode(const std::vector<rfdetr::TensorOutput>& outputs, const rfdet
 }
 
 void print_stats(const char* name, const Stats& stats) {
-    std::cout << std::left << std::setw(14) << name
-              << "mean=" << std::setw(10) << stats.mean << " ms "
-              << "P95=" << std::setw(10) << stats.p95 << " ms "
-              << "P99=" << std::setw(10) << stats.p99 << " ms "
-              << "Max=" << stats.max << " ms\n";
+    std::cout << std::left << std::setw(14) << name << "mean=" << std::setw(10) << stats.mean
+              << " ms P95=" << std::setw(10) << stats.p95 << " ms P99=" << std::setw(10)
+              << stats.p99 << " ms Max=" << stats.max << " ms\n";
 }
 
 }  // namespace
@@ -138,35 +146,96 @@ int main(int argc, char** argv) {
         const Arguments args = parse_arguments(argc, argv);
         rfdetr::TensorRTEngine engine(args.engine);
         const rfdetr::RgbImage image = rfdetr::load_image(args.image);
-
-        for (int i = 0; i < args.warmup; ++i) {
-            const auto input = rfdetr::preprocess(image, engine.input_width(), engine.input_height());
-            const auto outputs = args.runtime_mode == "persistent" ? engine.infer_persistent(input) : engine.infer(input);
-            static_cast<void>(decode(outputs, image, args.threshold, args.background_class));
+        const bool cuda_preprocess = args.runtime_mode == "cuda_preprocess" ||
+                                     args.runtime_mode == "cuda_preprocess_pinned" ||
+                                     args.runtime_mode == "cuda_preprocess_async" ||
+                                     args.runtime_mode == "cuda_graph";
+        const bool cuda_preprocess_pinned = args.runtime_mode == "cuda_preprocess_pinned";
+        const bool cuda_graph = args.runtime_mode == "cuda_graph";
+        const bool cuda_preprocess_async = args.runtime_mode == "cuda_preprocess_async";
+        std::unique_ptr<rfdetr::CudaPreprocessWorkspace> cuda_workspace;
+        if (cuda_preprocess) {
+            engine.initialize_persistent();
+            cuda_workspace = std::make_unique<rfdetr::CudaPreprocessWorkspace>();
+            if (cuda_graph) engine.initialize_cuda_graph();
+            if (cuda_preprocess_pinned) {
+                const std::size_t source_bytes = static_cast<std::size_t>(image.width) * image.height * 3;
+                cuda_workspace->copy_to_pinned_host(image.pixels.data(), source_bytes);
+            }
         }
+
+        const std::uint8_t* cuda_host_rgb = cuda_preprocess_pinned
+            ? cuda_workspace->pinned_host()
+            : image.pixels.data();
+
+        auto run_warmup = [&]() {
+            if (cuda_preprocess) {
+                rfdetr::preprocess_rgb_cuda(
+                    cuda_host_rgb, image.width, image.height,
+                    static_cast<float*>(engine.persistent_input_device()), engine.input_width(),
+                    engine.input_height(), engine.persistent_stream(), *cuda_workspace);
+                if (!cuda_preprocess_async && cudaStreamSynchronize(engine.persistent_stream()) != cudaSuccess) {
+                    throw std::runtime_error("cudaStreamSynchronize(preprocess warmup) failed");
+                }
+                static_cast<void>(cuda_graph ? engine.infer_persistent_device_input_cuda_graph()
+                                             : engine.infer_persistent_device_input());
+            } else {
+                const auto input = rfdetr::preprocess(image, engine.input_width(), engine.input_height());
+                if (args.runtime_mode == "persistent") {
+                    static_cast<void>(engine.infer_persistent(input));
+                } else {
+                    static_cast<void>(engine.infer(input));
+                }
+            }
+        };
+        for (int i = 0; i < args.warmup; ++i) run_warmup();
 
         std::vector<double> preprocess_times;
         std::vector<double> inference_times;
         std::vector<double> postprocess_times;
+        std::vector<double> end_to_end_times;
         preprocess_times.reserve(args.iterations);
         inference_times.reserve(args.iterations);
         postprocess_times.reserve(args.iterations);
+        end_to_end_times.reserve(args.iterations);
         std::size_t detection_count = 0;
-        for (int i = 0; i < args.iterations; ++i) {
-            const auto preprocess_begin = Clock::now();
-            const auto input = rfdetr::preprocess(image, engine.input_width(), engine.input_height());
-            const auto preprocess_end = Clock::now();
 
-            const auto inference_begin = Clock::now();
-            const auto outputs = args.runtime_mode == "persistent" ? engine.infer_persistent(input) : engine.infer(input);
-            const auto inference_end = Clock::now();
+        for (int i = 0; i < args.iterations; ++i) {
+            std::vector<rfdetr::TensorOutput> outputs;
+            const auto preprocess_begin = Clock::now();
+            Clock::time_point preprocess_end;
+            Clock::time_point inference_begin;
+            Clock::time_point inference_end;
+            if (cuda_preprocess) {
+                rfdetr::preprocess_rgb_cuda(
+                    cuda_host_rgb, image.width, image.height,
+                    static_cast<float*>(engine.persistent_input_device()), engine.input_width(),
+                    engine.input_height(), engine.persistent_stream(), *cuda_workspace);
+                if (!cuda_preprocess_async && cudaStreamSynchronize(engine.persistent_stream()) != cudaSuccess) {
+                    throw std::runtime_error("cudaStreamSynchronize(preprocess) failed");
+                }
+                preprocess_end = Clock::now();
+                inference_begin = Clock::now();
+                outputs = cuda_graph ? engine.infer_persistent_device_input_cuda_graph()
+                                     : engine.infer_persistent_device_input();
+                inference_end = Clock::now();
+            } else {
+                const auto input = rfdetr::preprocess(image, engine.input_width(), engine.input_height());
+                preprocess_end = Clock::now();
+                inference_begin = Clock::now();
+                outputs = args.runtime_mode == "persistent" ? engine.infer_persistent(input)
+                                                              : engine.infer(input);
+                inference_end = Clock::now();
+            }
 
             const auto postprocess_begin = Clock::now();
             detection_count += decode(outputs, image, args.threshold, args.background_class);
             const auto postprocess_end = Clock::now();
-
             preprocess_times.push_back(elapsed_ms(preprocess_begin, preprocess_end));
             inference_times.push_back(elapsed_ms(inference_begin, inference_end));
+            if (cuda_preprocess_async) {
+                end_to_end_times.push_back(elapsed_ms(preprocess_begin, inference_end));
+            }
             postprocess_times.push_back(elapsed_ms(postprocess_begin, postprocess_end));
         }
 
@@ -175,9 +244,13 @@ int main(int argc, char** argv) {
         std::cout << "iterations=" << args.iterations << " warmup=" << args.warmup
                   << " average_detections=" << static_cast<double>(detection_count) / args.iterations << '\n';
         std::cout << "runtime_mode=" << args.runtime_mode << '\n';
-        std::cout << "timing unit: milliseconds; inference includes H2D/D2H copies; per_call includes CUDA allocations, persistent reuses stream and device buffers\n";
+        std::cout << "timing unit: milliseconds; cuda_preprocess includes RGB H2D plus fused resize/normalize/layout; "
+                     "inference includes TensorRT and D2H; cuda_preprocess_async inference also waits for queued "
+                     "preprocess; per_call includes CUDA allocations, persistent reuses "
+                     "stream and device buffers\n";
         print_stats("preprocess", summarize(std::move(preprocess_times)));
         print_stats("inference", summarize(std::move(inference_times)));
+        if (cuda_preprocess_async) print_stats("end_to_end", summarize(std::move(end_to_end_times)));
         print_stats("postprocess", summarize(std::move(postprocess_times)));
         return 0;
     } catch (const std::exception& error) {

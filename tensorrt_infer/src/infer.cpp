@@ -99,6 +99,15 @@ TensorRTEngine::~TensorRTEngine() {
 }
 
 void TensorRTEngine::release_persistent() noexcept {
+    if (persistent_graph_exec_) {
+        cudaGraphExecDestroy(persistent_graph_exec_);
+        persistent_graph_exec_ = nullptr;
+    }
+    if (persistent_graph_) {
+        cudaGraphDestroy(persistent_graph_);
+        persistent_graph_ = nullptr;
+    }
+    persistent_graph_initialized_ = false;
     if (persistent_input_device_) {
         cudaFree(persistent_input_device_);
         persistent_input_device_ = nullptr;
@@ -150,6 +159,58 @@ void TensorRTEngine::initialize_persistent() {
         release_persistent();
         throw;
     }
+}
+
+void TensorRTEngine::initialize_cuda_graph() {
+    initialize_persistent();
+    if (persistent_graph_initialized_) return;
+
+    check_cuda(cudaStreamSynchronize(persistent_stream_), "cudaStreamSynchronize(graph capture precondition)");
+    if (cudaStreamBeginCapture(persistent_stream_, cudaStreamCaptureModeGlobal) != cudaSuccess) {
+        throw std::runtime_error("cudaStreamBeginCapture failed");
+    }
+    bool capture_ended = false;
+    try {
+        if (!context_->enqueueV3(persistent_stream_)) {
+            cudaGraph_t abandoned_graph = nullptr;
+            cudaStreamEndCapture(persistent_stream_, &abandoned_graph);
+            if (abandoned_graph) cudaGraphDestroy(abandoned_graph);
+            capture_ended = true;
+            throw std::runtime_error("enqueueV3 during CUDA Graph capture failed");
+        }
+        check_cuda(cudaStreamEndCapture(persistent_stream_, &persistent_graph_), "cudaStreamEndCapture");
+        capture_ended = true;
+        check_cuda(cudaGraphInstantiate(&persistent_graph_exec_, persistent_graph_, 0),
+                   "cudaGraphInstantiate");
+        persistent_graph_initialized_ = true;
+    } catch (...) {
+        if (!capture_ended) {
+            cudaGraph_t abandoned_graph = nullptr;
+            cudaStreamEndCapture(persistent_stream_, &abandoned_graph);
+            if (abandoned_graph) cudaGraphDestroy(abandoned_graph);
+        }
+        if (persistent_graph_exec_) {
+            cudaGraphExecDestroy(persistent_graph_exec_);
+            persistent_graph_exec_ = nullptr;
+        }
+        if (persistent_graph_) {
+            cudaGraphDestroy(persistent_graph_);
+            persistent_graph_ = nullptr;
+        }
+        throw;
+    }
+}
+
+void* TensorRTEngine::persistent_input_device() {
+    initialize_persistent();
+    return persistent_input_device_;
+}
+
+cudaStream_t TensorRTEngine::persistent_stream() const {
+    if (!persistent_initialized_ || !persistent_stream_) {
+        throw std::runtime_error("persistent runtime is not initialized");
+    }
+    return persistent_stream_;
 }
 
 std::vector<TensorOutput> TensorRTEngine::infer(const std::vector<float>& input) {
@@ -234,6 +295,75 @@ std::vector<TensorOutput> TensorRTEngine::infer_persistent(const std::vector<flo
                    "cudaMemcpyAsync(persistent output)");
     }
     check_cuda(cudaStreamSynchronize(persistent_stream_), "cudaStreamSynchronize(persistent)");
+    return outputs;
+}
+
+std::vector<TensorOutput> TensorRTEngine::infer_persistent_device_input() {
+    initialize_persistent();
+    const nvinfer1::Dims input_dims = engine_->getTensorShape(input_name_.c_str());
+    if (!context_->setInputShape(input_name_.c_str(), input_dims)) {
+        throw std::runtime_error("setInputShape(device input) failed");
+    }
+
+    // Rebind addresses on every device-input call. Some TensorRT versions may
+    // update execution-context bindings during an enqueue; explicit rebinding
+    // keeps this path independent of the preceding host-input API.
+    if (!context_->setTensorAddress(input_name_.c_str(), persistent_input_device_)) {
+        throw std::runtime_error("setTensorAddress(device input) failed");
+    }
+    for (std::size_t i = 0; i < output_names_.size(); ++i) {
+        if (!context_->setTensorAddress(output_names_[i].c_str(), persistent_output_devices_[i])) {
+            throw std::runtime_error("setTensorAddress(device output) failed");
+        }
+    }
+
+    std::vector<TensorOutput> outputs;
+    outputs.reserve(output_names_.size());
+    for (const std::string& name : output_names_) {
+        const nvinfer1::Dims dims = context_->getTensorShape(name.c_str());
+        check_dims(dims, name.c_str());
+        TensorOutput output;
+        output.name = name;
+        output.shape.reserve(dims.nbDims);
+        for (int j = 0; j < dims.nbDims; ++j) output.shape.push_back(dims.d[j]);
+        output.values.resize(volume(dims));
+        outputs.push_back(std::move(output));
+    }
+
+    if (!context_->enqueueV3(persistent_stream_)) throw std::runtime_error("enqueueV3(device input) failed");
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        check_cuda(cudaMemcpyAsync(outputs[i].values.data(), persistent_output_devices_[i],
+                                   outputs[i].values.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   persistent_stream_),
+                   "cudaMemcpyAsync(device output)");
+    }
+    check_cuda(cudaStreamSynchronize(persistent_stream_), "cudaStreamSynchronize(device input)");
+    return outputs;
+}
+
+std::vector<TensorOutput> TensorRTEngine::infer_persistent_device_input_cuda_graph() {
+    initialize_cuda_graph();
+    std::vector<TensorOutput> outputs;
+    outputs.reserve(output_names_.size());
+    for (const std::string& name : output_names_) {
+        const nvinfer1::Dims dims = context_->getTensorShape(name.c_str());
+        check_dims(dims, name.c_str());
+        TensorOutput output;
+        output.name = name;
+        output.shape.reserve(dims.nbDims);
+        for (int j = 0; j < dims.nbDims; ++j) output.shape.push_back(dims.d[j]);
+        output.values.resize(volume(dims));
+        outputs.push_back(std::move(output));
+    }
+
+    check_cuda(cudaGraphLaunch(persistent_graph_exec_, persistent_stream_), "cudaGraphLaunch");
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        check_cuda(cudaMemcpyAsync(outputs[i].values.data(), persistent_output_devices_[i],
+                                   outputs[i].values.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                   persistent_stream_),
+                   "cudaMemcpyAsync(graph output)");
+    }
+    check_cuda(cudaStreamSynchronize(persistent_stream_), "cudaStreamSynchronize(graph inference)");
     return outputs;
 }
 

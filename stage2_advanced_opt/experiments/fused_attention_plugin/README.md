@@ -8,7 +8,8 @@ QK^T -> Softmax -> AV
 
 三个 TensorRT 层替换成一个 TensorRT plugin。原生 CUDA 版本名为
 `RFDetrFusedAttention`，定义 `TORCH_FLASH` 编译的版本名为
-`RFDetrTorchFlashAttention`。当前固定形状为 `B=1、H=12、S=1226、D=64`。
+`RFDetrTorchFlashAttention`，CUTLASS 版本名为 `RFDetrCutlassFlashAttention`。
+当前固定形状为 `B=1、H=12、S=1226、D=64`。
 
 图改写脚本保留原图的 Q/V `[B,H,S,D]` 和 K `[B,H,D,S]` 输入。使用
 `--torch-flash` 时会在 plugin 前显式转置 K，FlashAttention 实际接收的
@@ -118,6 +119,60 @@ export LD_PRELOAD=$PWD/build/libtorch_sdpa_attention.so:$LD_PRELOAD
 导出符号。编译目标必须包含 `sm_120`，否则 RTX 5060 Ti 运行时可能出现
 `provided PTX was compiled with an unsupported toolchain`。`libtorch_sdpa_attention.so`
 及其 PyTorch/CUDA 依赖必须随运行时提供，所以该版本是 FlashAttention kernel
-性能验证原型，还不是可独立分发的 TensorRT engine。后续生产化需要去除 libtorch
-依赖，直接接入兼容的 FlashAttention/CUTLASS kernel，并逐层验证 12 个 attention
-输出后再进行 COCO 全量评估。
+性能验证原型。下面的 CUTLASS 版本用于去除这条 libtorch 依赖。
+
+两条依赖链可以用下面的脚本直接检查；它会确认参考 plugin 确实链接 torch，而独立
+CUTLASS plugin 不包含 `libtorch`/`libc10`：
+
+```bash
+./check_plugin_dependencies.sh
+```
+
+## 独立 CUTLASS FlashAttention plugin
+
+`cutlass_flash_attention_plugin.cu` 使用 CUTLASS 41 号 fused multi-head attention
+的 online Softmax/Tensor Core kernel，plugin 自己负责把 RF-DETR 的 Q/V
+`[B,H,S,D]` 和 K `[B,H,D,S]` 临时重排为 CUTLASS 所需的 BMHK 布局，再把输出重排回来。
+它只链接 TensorRT 和 CUDA，不包含 `libtorch.so`、`libtorch_cuda.so` 或 `libc10`。
+`cutlass_kernel_forward.h` 是从 CUTLASS 的 `kernel_forward.h` 提取并改名内部辅助符号后的
+固定版本；该头文件对应 CUTLASS commit
+`b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd`。完整 CUTLASS 源码作为构建依赖放在仓库外，
+避免把整个第三方仓库提交进项目。
+
+```bash
+cd /home/rton
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git cutlass
+cd /home/rton/rfdetr/stage2_advanced_opt/experiments/fused_attention_plugin
+CUTLASS_ROOT=/home/rton/cutlass ./build_cutlass_flash_plugin.sh
+
+conda run -n TensorRT python rewrite_to_plugin.py \
+  --input ../../../tensort_quant/artifacts_xlarge_smoothquant_256/rfdetr-xlarge-smoothquant-256.onnx \
+  --output rfdetr-xlarge-cutlass-flash-half.onnx --half --cutlass-flash
+
+# 构建阶段仍要加载 .so，让 ONNX parser 找到 creator；同时把 plugin 库嵌入 engine。
+/home/rton/TensorRT/TensorRT-11.4.0.106/bin/trtexec \
+  --onnx=rfdetr-xlarge-cutlass-flash-half.onnx \
+  --saveEngine=rfdetr-xlarge-cutlass-flash-half-embedded.engine \
+  --dynamicPlugins=build/libcutlass_flash_attention.so \
+  --setPluginsToSerialize=build/libcutlass_flash_attention.so \
+  --skipInference --builderOptimizationLevel=5
+```
+
+嵌入后的 engine 已验证可以在不设置 `LD_PRELOAD`、不传
+`--dynamicPlugins` 的情况下反序列化和推理；普通动态 plugin engine 仍需要在
+反序列化前注册 creator。嵌入 plugin 只解决运行时的外部 `.so` 查找，仍要求部署端的
+TensorRT/CUDA ABI、GPU 架构和 engine 构建环境匹配。
+
+本机 RTX 5060 Ti、TensorRT 11.4、`B=1,H=12,S=1226,D=64` 的结果：
+
+| 方案 | libtorch 依赖 | engine 纯 GPU latency | COCO val2017 mAP@[.5:.95] |
+|---|---|---:|---:|
+| 原生 tiled CUDA plugin | 无 | `108.4 ms` | 未作为候选 |
+| PyTorch SDPA/FlashAttention | 有 | `8.03 ms` | `0.5803911` |
+| 独立 CUTLASS plugin（动态加载） | 无 | `9.99 ms` | `0.5806461` |
+| 独立 CUTLASS plugin（plugin 嵌入 engine） | 无 | `9.86 ms`（10 次复测） | 与上行相同 |
+
+独立 CUTLASS 版本相对 SmoothQuant baseline（mAP `0.5802505`）没有精度下降，反而有
+`+0.000396` 的测量差异；它比 libtorch 版本慢约 `1.8 ms`，但已经满足“无 PyTorch
+运行时”的部署条件。当前 plugin 仍针对固定 encoder 形状，动态序列长度和其它 head
+配置需要单独实例化模板并重新验证。

@@ -19,7 +19,12 @@ from onnx import helper
 PREFIX = "/backbone/backbone.0/encoder/encoder/encoder/layer."
 
 
-def rewrite(model: onnx.ModelProto, expected_layers: int = 12, half: bool = False, torch_flash: bool = False) -> int:
+def rewrite(model: onnx.ModelProto, expected_layers: int = 12, half: bool = False, torch_flash: bool = False,
+            cutlass_flash: bool = False) -> int:
+    if torch_flash and cutlass_flash:
+        raise ValueError("--torch-flash and --cutlass-flash are mutually exclusive")
+    if cutlass_flash and not half:
+        raise ValueError("--cutlass-flash requires --half because the standalone kernel is FP16")
     nodes = list(model.graph.node)
     by_name = {n.name: n for n in nodes}
     removed: set[str] = set()
@@ -50,7 +55,8 @@ def rewrite(model: onnx.ModelProto, expected_layers: int = 12, half: bool = Fals
                 helper.make_node("Cast", [k_source], [k_half], prefix + "Plugin_K_Cast", to=10),
                 helper.make_node("Cast", [av.input[1]], [v_half], prefix + "Plugin_V_Cast", to=10),
                 helper.make_node(
-                    "RFDetrTorchFlashAttention" if torch_flash else "RFDetrFusedAttention",
+                    "RFDetrCutlassFlashAttention" if cutlass_flash else
+                    ("RFDetrTorchFlashAttention" if torch_flash else "RFDetrFusedAttention"),
                     [q_half, k_half, v_half], [plugin_out],
                     prefix + "RFDetrFusedAttention"
                 ),
@@ -85,9 +91,11 @@ def main() -> None:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--half", action="store_true", help="cast Q/K/V to FP16 around the plugin")
     p.add_argument("--torch-flash", action="store_true", help="use the libtorch SDPA plugin name")
+    p.add_argument("--cutlass-flash", action="store_true",
+                   help="use the standalone CUTLASS FMHA plugin name (requires --half)")
     args = p.parse_args()
     model = onnx.load(str(args.input), load_external_data=True)
-    count = rewrite(model, half=args.half, torch_flash=args.torch_flash)
+    count = rewrite(model, half=args.half, torch_flash=args.torch_flash, cutlass_flash=args.cutlass_flash)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model, str(args.output), save_as_external_data=False)
     print(f"replaced encoder attention blocks: {count} (half={args.half}, torch_flash={args.torch_flash})")
